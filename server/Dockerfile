@@ -53,6 +53,8 @@ RUN export DEBIAN_FRONTEND=noninteractive \
   && groupadd --gid 1000 mqm \
   && useradd --uid 1000 --gid mqm --home-dir /var/mqm mqm \
   && usermod -G mqm root \
+  && useradd alice -G mqm \
+  && echo alice:passw0rd | chpasswd \
   && cd /tmp/mq/MQServer \
   # Accept the MQ license
   && ./mqlicense.sh -text_only -accept \
