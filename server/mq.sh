@@ -54,6 +54,9 @@ config()
     if [ -f /etc/mqm/config.mqsc ]; then
       runmqsc ${MQ_QMGR_NAME} < /etc/mqm/config.mqsc
     fi
+     if [ -f /etc/mqm/QMGR.mqsc ]; then
+      runmqsc ${MQ_QMGR_NAME} < /etc/mqm/QMGR.mqsc
+    fi
   fi
   echo "----------------------------------------"
 }
