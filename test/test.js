@@ -18,6 +18,7 @@ const assert = require('chai').assert;
 const exec = require('child_process').exec;
 const fs = require('fs');
 const net = require('net');
+const tls = require('tls');
 
 // Pre-requisites for running this test:
 //   * Docker network created
@@ -45,27 +46,29 @@ describe('MQ Docker sample', function() {
         done();
       });
     });
-    it('should fail if MQ_QMGR_NAME is not set', function (done) {
-      exec(`docker run --rm --env LICENSE=accept  ${DOCKER_IMAGE}`, function (err, stdout, stderr) {
-        assert.equal(err.code, 1);
-        assert.isTrue(stderr.includes("ERROR"));
-        done();
-      });
-    });
   });
 
   // Utility function to run a container and wait until MQ starts
-  let runContainer = function(options) {
+  let runContainer = function(options, unsetQMName, hostname) {
     return new Promise((resolve, reject) => {
-      let cmd = `docker run -d --env LICENSE=accept --env MQ_QMGR_NAME=${QMGR_NAME} --net ${DOCKER_NETWORK} ${options} ${DOCKER_IMAGE}`;
+      let cmd = "";
+      let qmName = "";
+      if(!unsetQMName){
+        cmd = `docker run -d --env LICENSE=accept --env MQ_QMGR_NAME=${QMGR_NAME} --net ${DOCKER_NETWORK} ${options} ${DOCKER_IMAGE}`;
+        qmName=QMGR_NAME
+      } else{
+        cmd = `docker run -d --env LICENSE=accept --net ${DOCKER_NETWORK} ${options} ${DOCKER_IMAGE}`;
+        qmName=hostname
+      }
       exec(cmd, function (err, stdout, stderr) {
         if (err) reject(err);
         let containerId = stdout.trim();
+        let startStr = `IBM MQ Queue Manager ${qmName} is now fully running`;
         // Run dspmq every second, until the queue manager comes up
         let timer = setInterval(function() {
-          exec(`docker exec ${containerId} dspmq -n`, function (err, stdout, stderr) {
+          exec(`docker logs ${containerId}`, function (err, stdout, stderr) {
             if (err) reject(err);
-            if (stdout && stdout.includes("RUNNING")) {
+            if (stdout && stdout.includes(startStr)) {
               // Queue manager is up, so clear the timer
               clearInterval(timer);
               exec(`docker inspect --format '{{ .NetworkSettings.Networks.${DOCKER_NETWORK}.IPAddress }}' ${containerId}`, function (err, stdout, stderr) {
@@ -79,8 +82,97 @@ describe('MQ Docker sample', function() {
     });
   };
 
+  // Utility function to wait for the HTTPS web interface to become available
+  let waitForWeb = function(addr, port = 9443) {
+    return new Promise((resolve, reject) => {
+      const INTERVAL = 3000; //ms
+      let count = 0;
+      let timer = setInterval(() => {
+        count++;
+        if ((count * INTERVAL) >= 60000) {
+          clearInterval(timer);
+          reject(new Error(`Timed out connecting to port ${port}`));
+        }
+        else {
+          let socket = new tls.TLSSocket();
+          socket.on('connect', () => {
+            clearInterval(timer);
+            resolve();
+          });
+          socket.connect(port, addr);
+        }
+      }, INTERVAL);
+    });
+  };
+
+  // Utility function to delete a container
+  let deleteContainer = function(id) {
+    return new Promise((resolve, reject) => {
+      exec(`docker rm --force ${id}`, function (err, stdout, stderr) {
+        if (err) reject(err);
+        resolve();
+      });
+    });
+  };
+
   describe('with running container', function() {
     let container = null;
+    this.timeout(10000);
+
+    describe('and no queue manager variable supplied', function(){
+      let containerName="MQTestQM"
+
+      before(function() {
+        this.timeout(20000);
+        return runContainer("-h " + containerName, true, containerName)
+        .then((details) => {
+          container = details;
+        });
+      });
+      after(function() {
+        return deleteContainer(container.id);
+      });
+      it('should be using the hostname as the queue manager name', function (done) {
+        exec(`docker exec ${container.id} dspmq`, function (err, stdout, stderr) {
+          if (err) throw(err);
+          if (stdout && stdout.includes(containerName)) {
+            // Queue manager is up, so clear the timer
+            done();
+          }
+        });
+      });
+    });
+
+    describe('with running container', function() {
+      let container = null;
+      this.timeout(10000);
+
+      describe('and no queue manager variable supplied but the hostname has invalid characters', function(){
+        let containerName="MQ-Test-QM"
+        let containerValidName="MQTestQM"
+
+        before(function() {
+          this.timeout(20000);
+          return runContainer("-h " + containerName, true, containerValidName)
+          .then((details) => {
+            container = details;
+          });
+        });
+        after(function() {
+          return deleteContainer(container.id);
+        });
+        it('should be using the hostname as the queue manager name without the invalid characters', function (done) {
+          exec(`docker exec ${container.id} dspmq`, function (err, stdout, stderr) {
+            if (err) throw(err);
+            if (stdout && stdout.includes(containerValidName)) {
+              // Queue manager is up, so clear the timer
+              done();
+            }
+          });
+        });
+      });
+    });
+
 
     describe('and implicit volume', function() {
       before(function() {
@@ -90,22 +182,30 @@ describe('MQ Docker sample', function() {
           container = details;
         });
       });
+      after(function() {
+        return deleteContainer(container.id);
+      });
       it('should be listening on port 1414 on the Docker network', function (done) {
         const client = net.connect({host: container.addr, port: 1414}, () => {
-            client.on('close', done);
-            client.end();
+          client.on('close', done);
+          client.end();
         });
+      });
+      // Only run this test once, as it's quite slow
+      it('should be listening on port 9443 on the Docker network', function () {
+        this.timeout(120000);
+        return waitForWeb(container.addr);
       });
     });
 
     describe('and an empty bind-mounted volume', function() {
+      this.timeout(20000);
       let volumeDir = null;
       before(function() {
         volumeDir = fs.mkdtempSync(VOLUME_PREFIX);
       });
 
       before(function() {
-        this.timeout(20000);
         return runContainer(`--volume ${volumeDir}:/var/mqm`)
         .then((details) => {
           container = details;
@@ -113,9 +213,12 @@ describe('MQ Docker sample', function() {
       });
 
       after(function(done) {
-        exec(`rm -rf  ${volumeDir}`, function (err, stdout, stderr) {
-          if (err) throw err;
-          done();
+        deleteContainer(container.id)
+        .then(() => {
+          exec(`rm -rf  ${volumeDir}`, function (err, stdout, stderr) {
+            if (err) throw err;
+            done();
+          });
         });
       });
 
@@ -130,6 +233,7 @@ describe('MQ Docker sample', function() {
     // This can happen if the entire volume directory is actually a filesystem.
     // See https://github.com/ibm-messaging/mq-docker/issues/29
     describe('and a non-empty bind-mounted volume', function() {
+      this.timeout(20000);
       let volumeDir = null;
       before(function() {
         volumeDir = fs.mkdtempSync(VOLUME_PREFIX);
@@ -137,7 +241,6 @@ describe('MQ Docker sample', function() {
       });
 
       before(function() {
-        this.timeout(20000);
         return runContainer(`--volume ${volumeDir}:/var/mqm`)
         .then((details) => {
           container = details;
@@ -145,10 +248,13 @@ describe('MQ Docker sample', function() {
       });
 
       after(function(done) {
-        exec(`rm -rf  ${volumeDir}`, function (err, stdout, stderr) {
-          if (err) throw err;
+        deleteContainer(container.id)
+        .then(() => {
+          exec(`rm -rf  ${volumeDir}`, function (err, stdout, stderr) {
+            if (err) throw err;
             done();
           });
+        });
       });
 
       it('should be listening on port 1414 on the Docker network', function (done) {
@@ -159,9 +265,76 @@ describe('MQ Docker sample', function() {
       });
     });
 
-    afterEach(function(done) {
-      exec(`docker rm --force ${container.id}`, function (err, stdout, stderr) {
-        done();
+    // Bluemix presented a new challenge when attempting to use it's volumes
+    // Because Bluemix is more secure and only allows root users to edit mounted
+    // volumes (and MQ runs as mqm) we have to mount the volume at another directory
+    // and then mount /var/mqm to a folder within that which has the correct owner.
+    describe('and a mounted volume in a different location', function() {
+      this.timeout(20000);
+      let volumeDir = null;
+      before(function() {
+        volumeDir = fs.mkdtempSync(VOLUME_PREFIX);
+      });
+
+      before(function() {
+        return runContainer(`--volume ${volumeDir}:/mnt/mqm`)
+        .then((details) => {
+          container = details;
+        });
+      });
+
+      after(function(done) {
+        deleteContainer(container.id)
+        .then(() => {
+          exec(`rm -rf  ${volumeDir}`, function (err, stdout, stderr) {
+            if (err) throw err;
+            done();
+          });
+        });
+      });
+
+      it('should be listening on port 1414 on the Docker network', function (done) {
+        const client = net.connect({host: container.addr, port: 1414}, () => {
+            client.on('close', done);
+            client.end();
+        });
+      });
+    });
+
+    // Test that we can stop and start a container without it failing. This Test
+    // makes sure that the scripts we set to run on every start can be ran when
+    // MQ data is already present.
+    describe('and can be started multiple times', function() {
+      this.timeout(20000);
+      before(function() {
+        return runContainer(``)
+        .then((details) => {
+          container = details;
+        });
+      });
+
+      after(function() {
+        return deleteContainer(container.id);
+      });
+
+      it('should not fail', function (done) {
+        exec(`docker stop ${container.id}`, function (err, stdout, stderr) {
+          if (err) throw err;
+          exec(`docker start ${container.id}`, function (err, stdout, stderr) {
+            if (err) throw err;
+            let startStr = `IBM MQ Queue Manager ${QMGR_NAME} is now fully running`;
+            let timer = setInterval(function() {
+              exec(`docker logs ${container.id}`, function (err, stdout, stderr) {
+                if (err) throw(err);
+                if (stdout && stdout.includes(startStr)) {
+                  // Queue manager is up, so clear the timer
+                  clearInterval(timer);
+                  done();
+                }
+              });
+            }, 1000);
+          });
+        });
       });
     });
   });
